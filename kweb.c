@@ -2,13 +2,12 @@
 #include <linux/init.h>
 #include <linux/module.h>
 #include <linux/moduleparam.h>
-#include <linux/sched.h>
+#include <linux/kthread.h>
 #include <linux/socket.h>
 #include <linux/net.h>
 #include <linux/in.h>
 #include <linux/stat.h>
 #include <net/sock.h>
-
 
 #define BUFFSIZE (1*1024)
 
@@ -24,33 +23,35 @@ module_param(KiB, uint, S_IRUGO);
 #endif
 #define _KWEBMSG(_msg,args...) /* print nothing */
 
-int start = 0;
-
-static void connection_handler(struct work_struct * ignore);
+static int connection_handler(void *data);
 void http_server(struct socket *csocket);
-char *inet_ntoa(struct in_addr in);
 int sendmsg(struct socket *csocket, const void *data, size_t datalength, int flags);
 
-struct socket *sock;
 
-static DECLARE_WORK(connection_work, connection_handler);
 
-static void connection_handler(struct work_struct * ignore)
+static struct task_struct *connection_tsk;
+
+
+static int connection_handler(void *data)
 {
-    int rc,s_status,len = 0;
-    struct socket *newsock;
+    int rc,s_status;
+    struct socket *sock = NULL;
+    struct socket *newsock = NULL;
     struct sockaddr_in locaddr;
-    struct sockaddr_in peeraddr;
-    char * client_ip;
-
-    KWEBMSG("Socket server work now.\n");
-    rc = sock_create(PF_INET, SOCK_STREAM, 0, &sock);
+    int one = 1;
     
+    KWEBMSG("Socket server start.\n");
+
+    rc = sock_create_kern(PF_INET, SOCK_STREAM, 0, &sock);
     if ( rc < 0 ) {
         KWEBMSG( "ERROR - Could not create socket\n");
-        return;
+        goto threadout;
     }
 
+    rc = kernel_setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, (char *)&one, sizeof(one));
+    if (rc < 0) {
+        KWEBMSG("Failed to set SO_REUSEADDR on socket: %d", rc);
+    }
 
     memset(&locaddr, 0, sizeof(locaddr));
     locaddr.sin_family = AF_INET;  
@@ -60,11 +61,11 @@ static void connection_handler(struct work_struct * ignore)
 
     if (rc == -EADDRINUSE) {
         KWEBMSG( "ERROR - Port %d already in use\n",port);
-        return;
+        goto threadout;
     }
     if (rc != 0) {
         KWEBMSG( "ERROR - Can't bind to port %d\n",port);
-        return;
+        goto threadout;
     }
 
     rc = kernel_listen(sock, 0);
@@ -73,7 +74,7 @@ static void connection_handler(struct work_struct * ignore)
     KWEBMSG("Waiting for client's request\n");
 
 
-    do {
+    while ( ! kthread_should_stop() ) {
 
         rc = wait_event_interruptible_timeout(
 #if (LINUX_VERSION_CODE <= KERNEL_VERSION(2,6,35))
@@ -93,18 +94,23 @@ static void connection_handler(struct work_struct * ignore)
 
         _KWEBMSG("%d,%d\n",rc,s_status);
 
-        rc = kernel_getpeername(newsock, (struct sockaddr *)&peeraddr, &len);
-        client_ip = inet_ntoa(peeraddr.sin_addr);
-        KWEBMSG("Client IP:%s, Client port:%d\n", client_ip, peeraddr.sin_port);
-        kfree(client_ip);
-
-        http_server(newsock);
+        if ( ! kthread_should_stop() ) http_server(newsock);
 
         KWEBMSG("Close client socket\n");
         if( newsock != NULL ) sock_release(newsock);
         newsock = NULL;
 
-    } while (start);
+    }
+    KWEBMSG("Socket server stop.\n");
+
+
+    rc = 0;
+
+threadout:
+    connection_tsk = NULL;
+    if ( sock != NULL ) sock_release(sock);
+    sock = NULL;
+    return rc;
 
 }
 
@@ -112,6 +118,8 @@ void http_server(struct socket *csocket)
 {
     char *request;
     char *response;
+
+    char * substring;
 
     int length,i;
     struct msghdr msg;
@@ -141,12 +149,24 @@ void http_server(struct socket *csocket)
 
     if ( length <= 0 ) {
         KWEBMSG( "Read from socket failed\n");
+        goto out;
     }
-    else {
-        _KWEBMSG("Request:%s\n",request);
 
-        KWEBMSG("HTTP request received\n");
+    _KWEBMSG("Request:%s\n",request);
 
+    substring = strsep(&request," ");
+    KWEBMSG("Method:%s\n",substring);
+
+    /* Only support "GET" method */
+    if ( substring && strncmp(substring, "GET",3) != 0 ) goto out;
+
+    substring = strsep(&request," ");
+    KWEBMSG("Query:%s\n",substring);
+
+    KWEBMSG("HTTP request received\n");
+
+    if ( substring && strncmp(substring, "/give_me_data",13) == 0 )
+    {
         snprintf(response, BUFFSIZE, "HTTP/1.0 200 OK\r\n"
             "Access-Control-Allow-Origin: *\r\n"
             "Content-Type: text/html\r\n"
@@ -160,7 +180,13 @@ void http_server(struct socket *csocket)
 
         KWEBMSG("HTTP send msg(%d Kbytes)\n",KiB);
     }
+    else {
+        snprintf(response, BUFFSIZE, "HTTP/1.0 404 Not Found\r\n\nNot Found\n");
+        sendmsg(csocket,response,strlen(response),0);
+    }
 
+
+out:
     kfree(request);
     kfree(response);
 }
@@ -189,31 +215,24 @@ int sendmsg(struct socket *csocket, const void *data, size_t datalength, int fla
 static int __init kweb_module_init(void)
 {
     int rv;
-    start = 1;
 
-    rv = schedule_work(&connection_work);
-
-    KWEBMSG("schedule_work: %d\n",rv);
     KWEBMSG("Kweb module init\n");
 
+    connection_tsk = kthread_run(connection_handler, NULL, "kweb_connection");
+    if (IS_ERR(connection_tsk)) {
+        rv = PTR_ERR(connection_tsk);
+        KWEBMSG("kthread create ERROR: %d\n",rv);
+        connection_tsk = NULL;
+        return rv;
+    }
+
     return 0;
+
 }
 
 static void __exit kweb_module_cleanup(void)
 {
-    int rv;
-    start = 0;
-
-    rv = cancel_work_sync(&connection_work);
-    KWEBMSG("cancel_work_sync: %d\n",rv);
-
-    rv = flush_work(&connection_work);
-    KWEBMSG("flush_work: %d\n",rv);
-
-    
-    if( sock != NULL ) sock_release(sock);
-    sock = NULL;
-
+    if ( connection_tsk != NULL ) kthread_stop(connection_tsk);
 
     KWEBMSG("Kweb module exit\n");
 }
@@ -222,23 +241,3 @@ module_init(kweb_module_init);
 module_exit(kweb_module_cleanup);
 MODULE_DESCRIPTION("Kernel HTTP server for speed test.");
 MODULE_LICENSE("GPL");
-
-char *inet_ntoa(struct in_addr in)
-{
-    char* str_ip = NULL;
-    u_int32_t int_ip = 0;
-    
-    str_ip = kmalloc(16 * sizeof(char), GFP_KERNEL);
-    if (!str_ip)
-        return NULL;
-    else
-        memset(str_ip, 0, 16);
-
-    int_ip = in.s_addr;
-    
-    sprintf(str_ip, "%d.%d.%d.%d",  (int_ip      ) & 0xFF,
-                                    (int_ip >> 8 ) & 0xFF,
-                                    (int_ip >> 16) & 0xFF,
-                                    (int_ip >> 24) & 0xFF);
-    return str_ip;
-}

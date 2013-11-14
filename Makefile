@@ -1,6 +1,6 @@
-.PHONY: clean install uninstall
+.PHONY: clean all
 
-obj-m := kweb.o
+obj-m := kweb_kthread.o
 
 KDIR  := /lib/modules/$(shell uname -r)/build
 KMOD  := /lib/modules/$(shell uname -r)/kernel
@@ -13,9 +13,9 @@ ifeq ($(DEBUG),y)
 	EXTRA_CFLAGS += -O -g -DKWEB_DEBUG
 endif
 
-default:
+all:
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
 
 clean:
-	rm -rf *.ko *.o *.mod.* .H* .tm* .*cmd Module.symvers
+	rm -rf *.ko *.o *.mod.* .H* .tm* .*cmd Module.symvers modules.order
 
