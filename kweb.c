@@ -119,6 +119,8 @@ void http_server(struct socket *csocket)
     char *request;
     char *response;
 
+    char *ptr_res;
+
     char * substring;
 
     int length,i;
@@ -153,14 +155,15 @@ void http_server(struct socket *csocket)
     }
 
     _KWEBMSG("Request:%s\n",request);
+    ptr_res = request;
 
-    substring = strsep(&request," ");
+    substring = strsep(&ptr_res," ");
     KWEBMSG("Method:%s\n",substring);
 
     /* Only support "GET" method */
     if ( substring && strncmp(substring, "GET",3) != 0 ) goto out;
 
-    substring = strsep(&request," ");
+    substring = strsep(&ptr_res," ");
     KWEBMSG("Query:%s\n",substring);
 
     KWEBMSG("HTTP request received\n");
