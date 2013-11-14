@@ -1,6 +1,6 @@
 .PHONY: clean all
 
-obj-m := kweb_kthread.o
+obj-m := kweb.o
 
 KDIR  := /lib/modules/$(shell uname -r)/build
 KMOD  := /lib/modules/$(shell uname -r)/kernel
