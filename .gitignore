@@ -16,3 +16,11 @@
 *.exe
 *.out
 *.app
+
+# Module
+*.mod.*
+Module.symvers
+modules.order
+.tm*
+.*cmd
+
